@@ -25,12 +25,79 @@
  * A request is OK only if it has exactly one negative row and exactly one
  * positive row, and their deltas sum to zero. Every other request is flagged.
  */
+/*
+ * Approach: one pass over the rows into an open-addressing hash table keyed
+ * by request ID (linear probing), then one pass over the table to collect
+ * flagged IDs.
+ *   - Occupancy is a separate flag, so every 64-bit value (0, UINT64_MAX)
+ *     is a valid key; there is no sentinel key.
+ *   - IDs are mixed with the murmur3 fmix64 finalizer before masking, so IDs
+ *     that differ only in high bits do not pile into one probe chain.
+ *   - neg/pos are saturating counters capped at 2: "2" means "2 or more",
+ *     so a large group can never wrap back to look like "exactly one".
+ *   - Capacity is a power of two >= 2 * (max distinct IDs), allocated once:
+ *     load factor <= 0.5, so probe chains stay short and always terminate.
+ *   - The table is the only allocation (one calloc), sized from n.
+ */
+#define MAX_DISTINCT 5000000u
+#define PREFETCH_DIST 16
+
+typedef struct {
+    uint64_t key;
+    int64_t sum;   /* |sum| <= 10^18, fits in int64 per the README bounds */
+    uint8_t used;
+    uint8_t neg;   /* saturates at 2 */
+    uint8_t pos;   /* saturates at 2 */
+} Slot;
+
+static inline uint64_t mix64(uint64_t x) {
+    x ^= x >> 33;
+    x *= 0xff51afd7ed558ccdULL;
+    x ^= x >> 33;
+    x *= 0xc4ceb9fe1a85ec53ULL;
+    x ^= x >> 33;
+    return x;
+}
+
 static size_t reconcile(size_t n, const uint64_t *req_id, const int32_t *acct,
                         const int64_t *delta, int32_t M, int64_t *net,
                         uint64_t *bad) {
-    (void)n; (void)req_id; (void)acct; (void)delta; (void)M; (void)net; (void)bad;
-    /* TODO: your implementation */
-    return 0;
+    (void)M; /* acct[i] is guaranteed to be in [0, M) */
+    for (size_t i = 0; i < n; i++) net[acct[i]] += delta[i];
+    if (n == 0) return 0;
+
+    size_t distinct_max = n < MAX_DISTINCT ? n : MAX_DISTINCT;
+    size_t cap = 16;
+    while (cap < 2 * distinct_max) cap <<= 1;
+    size_t mask = cap - 1;
+    Slot *table = calloc(cap, sizeof *table);
+    if (!table) { fprintf(stderr, "error: out of memory\n"); exit(2); }
+
+    for (size_t i = 0; i < n; i++) {
+#if defined(__GNUC__) || defined(__clang__)
+        /* Rows are in random order, so nearly every probe is a cache miss;
+         * start loading the slot for a row a few iterations ahead. */
+        if (i + PREFETCH_DIST < n)
+            __builtin_prefetch(&table[mix64(req_id[i + PREFETCH_DIST]) & mask], 1);
+#endif
+        uint64_t k = req_id[i];
+        size_t h = (size_t)mix64(k) & mask;
+        while (table[h].used && table[h].key != k) h = (h + 1) & mask;
+        Slot *s = &table[h];
+        if (!s->used) { s->used = 1; s->key = k; }
+        s->sum += delta[i];
+        if (delta[i] < 0) { if (s->neg < 2) s->neg++; }
+        else              { if (s->pos < 2) s->pos++; }
+    }
+
+    size_t nbad = 0;
+    for (size_t h = 0; h < cap; h++) {
+        const Slot *s = &table[h];
+        if (s->used && !(s->neg == 1 && s->pos == 1 && s->sum == 0))
+            bad[nbad++] = s->key;
+    }
+    free(table);
+    return nbad;
 }
 
 /* ---- I/O harness: you should not need to change anything below. ---- */
